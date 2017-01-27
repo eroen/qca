@@ -37,6 +37,12 @@
 #include <openssl/x509v3.h>
 #include <openssl/pkcs12.h>
 #include <openssl/ssl.h>
+#include <openssl/asn1.h>
+#include <openssl/asn1t.h>
+#include <openssl/bn.h>
+#include <openssl/dh.h>
+#include <openssl/dsa.h>
+#include <openssl/rsa.h>
 
 #ifndef OSSL_097
 // comment this out if you'd rather use openssl 0.9.6
@@ -50,6 +56,11 @@
 #undef CHECKED_PTR_OF
 #define CHECKED_PTR_OF(type, p) \
 	((_STACK*) (1 ? p : (type*)0))
+#endif
+
+#if OPENSSL_VERSION_NUMBER >= 0x10100000L
+#define OPENSSL_NO_SSL2
+#define OPENSSL_NO_TLS1
 #endif
 
 using namespace QCA;
@@ -93,7 +104,7 @@ static QByteArray bio2ba(BIO *b)
 	return buf;
 }
 
-static BigInteger bn2bi(BIGNUM *n)
+static BigInteger bn2bi(const BIGNUM *n)
 {
 	SecureArray buf(BN_num_bytes(n) + 1);
 	buf[0] = 0; // positive
@@ -109,7 +120,7 @@ static BIGNUM *bi2bn(const BigInteger &n)
 
 // take lowest bytes of BIGNUM to fit
 // pad with high byte zeroes to fit
-static SecureArray bn2fixedbuf(BIGNUM *n, int size)
+static SecureArray bn2fixedbuf(const BIGNUM *n, int size)
 {
 	SecureArray buf(BN_num_bytes(n));
 	BN_bn2bin(n, (unsigned char *)buf.data());
@@ -127,8 +138,18 @@ static SecureArray dsasig_der_to_raw(const SecureArray &in)
 	const unsigned char *inp = (const unsigned char *)in.data();
 	d2i_DSA_SIG(&sig, &inp, in.size());
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	SecureArray part_r = bn2fixedbuf(sig->r, 20);
 	SecureArray part_s = bn2fixedbuf(sig->s, 20);
+#else
+	SecureArray part_r, part_s;
+	{
+		const BIGNUM *pr, *ps;
+		DSA_SIG_get0(sig, &pr, &ps);
+		part_r = bn2fixedbuf(pr, 20);
+		part_s = bn2fixedbuf(ps, 20);
+	}
+#endif
 	SecureArray result;
 	result.append(part_r);
 	result.append(part_s);
@@ -147,8 +168,14 @@ static SecureArray dsasig_raw_to_der(const SecureArray &in)
 	SecureArray part_s(20);
 	memcpy(part_r.data(), in.data(), 20);
 	memcpy(part_s.data(), in.data() + 20, 20);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	sig->r = BN_bin2bn((const unsigned char *)part_r.data(), part_r.size(), NULL);
 	sig->s = BN_bin2bn((const unsigned char *)part_s.data(), part_s.size(), NULL);
+#else
+	DSA_SIG_set0(sig,
+		BN_bin2bn((const unsigned char *)part_r.data(), part_r.size(), NULL),
+		BN_bin2bn((const unsigned char *)part_s.data(), part_s.size(), NULL));
+#endif
 
 	int len = i2d_DSA_SIG(sig, NULL);
 	SecureArray result(len);
@@ -399,7 +426,11 @@ static GENERAL_NAME *new_general_name(const CertificateInfoType &t, const QStrin
 	{
 		QByteArray buf = val.toLatin1();
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		ASN1_IA5STRING *str = M_ASN1_IA5STRING_new();
+#else
+		ASN1_IA5STRING *str = ASN1_IA5STRING_new();
+#endif
 		ASN1_STRING_set((ASN1_STRING *)str, (unsigned char *)buf.data(), buf.size());
 
 		name = GENERAL_NAME_new();
@@ -411,7 +442,11 @@ static GENERAL_NAME *new_general_name(const CertificateInfoType &t, const QStrin
 	{
 		QByteArray buf = val.toLatin1();
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		ASN1_IA5STRING *str = M_ASN1_IA5STRING_new();
+#else
+		ASN1_IA5STRING *str = ASN1_IA5STRING_new();
+#endif
 		ASN1_STRING_set((ASN1_STRING *)str, (unsigned char *)buf.data(), buf.size());
 
 		name = GENERAL_NAME_new();
@@ -423,7 +458,11 @@ static GENERAL_NAME *new_general_name(const CertificateInfoType &t, const QStrin
 	{
 		QByteArray buf = val.toLatin1();
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		ASN1_IA5STRING *str = M_ASN1_IA5STRING_new();
+#else
+		ASN1_IA5STRING *str = ASN1_IA5STRING_new();
+#endif
 		ASN1_STRING_set((ASN1_STRING *)str, (unsigned char *)buf.data(), buf.size());
 
 		name = GENERAL_NAME_new();
@@ -529,7 +568,11 @@ static void try_get_general_name(GENERAL_NAMES *names, const CertificateInfoType
 			GENERAL_NAME *gn = find_next_general_name(names, GEN_EMAIL, &pos);
 			if (pos != -1)
 			{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				QByteArray cs((const char *)ASN1_STRING_data(gn->d.rfc822Name), ASN1_STRING_length(gn->d.rfc822Name));
+#else
+				QByteArray cs((const char *)ASN1_STRING_get0_data(gn->d.rfc822Name), ASN1_STRING_length(gn->d.rfc822Name));
+#endif
 				info->insert(t, QString::fromLatin1(cs));
 				++pos;
 			}
@@ -544,7 +587,12 @@ static void try_get_general_name(GENERAL_NAMES *names, const CertificateInfoType
 			GENERAL_NAME *gn = find_next_general_name(names, GEN_URI, &pos);
 			if (pos != -1)
 			{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				QByteArray cs((const char *)ASN1_STRING_data(gn->d.uniformResourceIdentifier), ASN1_STRING_length(gn->d.uniformResourceIdentifier));
+#else
+				QByteArray cs((const char *)ASN1_STRING_get0_data(gn->d.uniformResourceIdentifier), ASN1_STRING_length(gn->d.uniformResourceIdentifier));
+#endif
+
 				info->insert(t, QString::fromLatin1(cs));
 				++pos;
 			}
@@ -559,7 +607,11 @@ static void try_get_general_name(GENERAL_NAMES *names, const CertificateInfoType
 			GENERAL_NAME *gn = find_next_general_name(names, GEN_DNS, &pos);
 			if (pos != -1)
 			{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				QByteArray cs((const char *)ASN1_STRING_data(gn->d.dNSName), ASN1_STRING_length(gn->d.dNSName));
+#else
+				QByteArray cs((const char *)ASN1_STRING_get0_data(gn->d.dNSName), ASN1_STRING_length(gn->d.dNSName));
+#endif
 				info->insert(t, QString::fromLatin1(cs));
 				++pos;
 			}
@@ -575,7 +627,11 @@ static void try_get_general_name(GENERAL_NAMES *names, const CertificateInfoType
 			if (pos != -1)
 			{
 				ASN1_OCTET_STRING *str = gn->d.iPAddress;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				QByteArray buf((const char *)ASN1_STRING_data(str), ASN1_STRING_length(str));
+#else
+				QByteArray buf((const char *)ASN1_STRING_get0_data(str), ASN1_STRING_length(str));
+#endif
 
 				QString out;
 				// IPv4 (TODO: handle IPv6)
@@ -613,7 +669,11 @@ static void try_get_general_name(GENERAL_NAMES *names, const CertificateInfoType
 					break;
 
 				ASN1_UTF8STRING *str = at->value.utf8string;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				QByteArray buf((const char *)ASN1_STRING_data(str), ASN1_STRING_length(str));
+#else
+				QByteArray buf((const char *)ASN1_STRING_get0_data(str), ASN1_STRING_length(str));
+#endif
 				info->insert(t, QString::fromUtf8(buf));
 				++pos;
 			}
@@ -867,7 +927,11 @@ static QStringList get_cert_policies(X509_EXTENSION *ex)
 static QByteArray get_cert_subject_key_id(X509_EXTENSION *ex)
 {
 	ASN1_OCTET_STRING *skid = (ASN1_OCTET_STRING *)X509V3_EXT_d2i(ex);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	QByteArray out((const char *)ASN1_STRING_data(skid), ASN1_STRING_length(skid));
+#else
+	QByteArray out((const char *)ASN1_STRING_get0_data(skid), ASN1_STRING_length(skid));
+#endif
 	ASN1_OCTET_STRING_free(skid);
 	return out;
 }
@@ -879,7 +943,11 @@ static QByteArray get_cert_issuer_key_id(X509_EXTENSION *ex)
 	AUTHORITY_KEYID *akid = (AUTHORITY_KEYID *)X509V3_EXT_d2i(ex);
 	QByteArray out;
 	if (akid->keyid)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		out = QByteArray((const char *)ASN1_STRING_data(akid->keyid), ASN1_STRING_length(akid->keyid));
+#else
+		out = QByteArray((const char *)ASN1_STRING_get0_data(akid->keyid), ASN1_STRING_length(akid->keyid));
+#endif
 	AUTHORITY_KEYID_free(akid);
 	return out;
 }
@@ -1004,29 +1072,33 @@ public:
 	opensslHashContext(const EVP_MD *algorithm, Provider *p, const QString &type) : HashContext(p, type)
 	{
 		m_algorithm = algorithm;
-		EVP_DigestInit( &m_context, m_algorithm );
+		EVP_DigestInit( m_context, m_algorithm );
 	}
 
 	~opensslHashContext()
 	{
-		EVP_MD_CTX_cleanup(&m_context);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		EVP_MD_CTX_cleanup(m_context);
+#else
+		EVP_MD_CTX_free(m_context);
+#endif
 	}
 
 	void clear()
 	{
-		EVP_MD_CTX_cleanup(&m_context);
-		EVP_DigestInit( &m_context, m_algorithm );
+		EVP_MD_CTX_reset(m_context);
+		EVP_DigestInit( m_context, m_algorithm );
 	}
 
 	void update(const MemoryRegion &a)
 	{
-		EVP_DigestUpdate( &m_context, (unsigned char*)a.data(), a.size() );
+		EVP_DigestUpdate( m_context, (unsigned char*)a.data(), a.size() );
 	}
 
 	MemoryRegion final()
 	{
 		SecureArray a( EVP_MD_size( m_algorithm ) );
-		EVP_DigestFinal( &m_context, (unsigned char*)a.data(), 0 );
+		EVP_DigestFinal( m_context, (unsigned char*)a.data(), 0 );
 		return a;
 	}
 
@@ -1037,7 +1109,7 @@ public:
 
 protected:
 	const EVP_MD *m_algorithm;
-	EVP_MD_CTX m_context;
+	EVP_MD_CTX *m_context;
 };
 
 
@@ -1047,7 +1119,16 @@ public:
 	opensslPbkdf1Context(const EVP_MD *algorithm, Provider *p, const QString &type) : KDFContext(p, type)
 	{
 		m_algorithm = algorithm;
-		EVP_DigestInit( &m_context, m_algorithm );
+		EVP_DigestInit( m_context, m_algorithm );
+	}
+
+	~opensslPbkdf1Context()
+	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		EVP_MD_CTX_cleanup(m_context);
+#else
+		EVP_MD_CTX_free(m_context);
+#endif
 	}
 
 	Provider::Context *clone() const
@@ -1081,16 +1162,16 @@ public:
 		  DK = Tc<0..dkLen-1>
 		*/
 		// calculate T_1
-		EVP_DigestUpdate( &m_context, (unsigned char*)secret.data(), secret.size() );
-		EVP_DigestUpdate( &m_context, (unsigned char*)salt.data(), salt.size() );
+		EVP_DigestUpdate( m_context, (unsigned char*)secret.data(), secret.size() );
+		EVP_DigestUpdate( m_context, (unsigned char*)salt.data(), salt.size() );
 		SecureArray a( EVP_MD_size( m_algorithm ) );
-		EVP_DigestFinal( &m_context, (unsigned char*)a.data(), 0 );
+		EVP_DigestFinal( m_context, (unsigned char*)a.data(), 0 );
 
 		// calculate T_2 up to T_c
 		for ( unsigned int i = 2; i <= iterationCount; ++i ) {
-			EVP_DigestInit( &m_context, m_algorithm );
-			EVP_DigestUpdate( &m_context, (unsigned char*)a.data(), a.size() );
-			EVP_DigestFinal( &m_context, (unsigned char*)a.data(), 0 );
+			EVP_DigestInit( m_context, m_algorithm );
+			EVP_DigestUpdate( m_context, (unsigned char*)a.data(), a.size() );
+			EVP_DigestFinal( m_context, (unsigned char*)a.data(), 0 );
 		}
 
 		// shrink a to become DK, of the required length
@@ -1136,19 +1217,19 @@ public:
 		  DK = Tc<0..dkLen-1>
 		*/
 		// calculate T_1
-		EVP_DigestUpdate( &m_context, (unsigned char*)secret.data(), secret.size() );
-		EVP_DigestUpdate( &m_context, (unsigned char*)salt.data(), salt.size() );
+		EVP_DigestUpdate( m_context, (unsigned char*)secret.data(), secret.size() );
+		EVP_DigestUpdate( m_context, (unsigned char*)salt.data(), salt.size() );
 		SecureArray a( EVP_MD_size( m_algorithm ) );
-		EVP_DigestFinal( &m_context, (unsigned char*)a.data(), 0 );
+		EVP_DigestFinal( m_context, (unsigned char*)a.data(), 0 );
 
 		// calculate T_2 up to T_c
 		*iterationCount = 2 - 1;	// <- Have to remove 1, unless it computes one
 		timer.start();				// ^  time more than the base function
 									// ^  with the same iterationCount
 		while (timer.elapsed() < msecInterval) {
-			EVP_DigestInit( &m_context, m_algorithm );
-			EVP_DigestUpdate( &m_context, (unsigned char*)a.data(), a.size() );
-			EVP_DigestFinal( &m_context, (unsigned char*)a.data(), 0 );
+			EVP_DigestInit( m_context, m_algorithm );
+			EVP_DigestUpdate( m_context, (unsigned char*)a.data(), a.size() );
+			EVP_DigestFinal( m_context, (unsigned char*)a.data(), 0 );
 			++(*iterationCount);
 		}
 
@@ -1163,7 +1244,7 @@ public:
 
 protected:
 	const EVP_MD *m_algorithm;
-	EVP_MD_CTX m_context;
+	EVP_MD_CTX *m_context;
 };
 
 class opensslPbkdf2Context : public KDFContext
@@ -1231,12 +1312,17 @@ public:
 	opensslHMACContext(const EVP_MD *algorithm, Provider *p, const QString &type) : MACContext(p, type)
 	{
 		m_algorithm = algorithm;
-		HMAC_CTX_init( &m_context );
+		m_context = HMAC_CTX_new();
+	}
+
+	~opensslHMACContext()
+	{
+		HMAC_CTX_free(m_context);
 	}
 
 	void setup(const SymmetricKey &key)
 	{
-		HMAC_Init_ex( &m_context, key.data(), key.size(), m_algorithm, 0 );
+		HMAC_Init_ex( m_context, key.data(), key.size(), m_algorithm, 0 );
 	}
 
 	KeyLength keyLength() const
@@ -1246,14 +1332,14 @@ public:
 
 	void update(const MemoryRegion &a)
 	{
-		HMAC_Update( &m_context, (unsigned char *)a.data(), a.size() );
+		HMAC_Update( m_context, (unsigned char *)a.data(), a.size() );
 	}
 
 	void final(MemoryRegion *out)
 	{
 		SecureArray sa( EVP_MD_size( m_algorithm ), 0 );
-		HMAC_Final(&m_context, (unsigned char *)sa.data(), 0 );
-		HMAC_CTX_cleanup(&m_context);
+		HMAC_Final(m_context, (unsigned char *)sa.data(), 0 );
+		HMAC_CTX_reset(m_context);
 		*out = sa;
 	}
 
@@ -1263,7 +1349,7 @@ public:
 	}
 
 protected:
-	HMAC_CTX m_context;
+	HMAC_CTX *m_context;
 	const EVP_MD *m_algorithm;
 };
 
@@ -1277,7 +1363,7 @@ class EVPKey
 public:
 	enum State { Idle, SignActive, SignError, VerifyActive, VerifyError };
 	EVP_PKEY *pkey;
-	EVP_MD_CTX mdctx;
+	EVP_MD_CTX *mdctx;
 	State state;
 	bool raw_type;
 	SecureArray raw;
@@ -1287,18 +1373,24 @@ public:
 		pkey = 0;
 		raw_type = false;
 		state = Idle;
+		mdctx = EVP_MD_CTX_new();
 	}
 
 	EVPKey(const EVPKey &from)
 	{
 		pkey = from.pkey;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&pkey->references, 1, CRYPTO_LOCK_EVP_PKEY);
+#else
+		EVP_PKEY_up_ref(pkey);
+#endif
 		raw_type = false;
 		state = Idle;
 	}
 
 	~EVPKey()
 	{
+		EVP_MD_CTX_free(mdctx);
 		reset();
 	}
 
@@ -1322,8 +1414,8 @@ public:
 		else
 		{
 			raw_type = false;
-			EVP_MD_CTX_init(&mdctx);
-			if(!EVP_SignInit_ex(&mdctx, type, NULL))
+			EVP_MD_CTX_init(mdctx);
+			if(!EVP_SignInit_ex(mdctx, type, NULL))
 				state = SignError;
 		}
 	}
@@ -1339,8 +1431,8 @@ public:
 		else
 		{
 			raw_type = false;
-			EVP_MD_CTX_init(&mdctx);
-			if(!EVP_VerifyInit_ex(&mdctx, type, NULL))
+			EVP_MD_CTX_init(mdctx);
+			if(!EVP_VerifyInit_ex(mdctx, type, NULL))
 				state = VerifyError;
 		}
 	}
@@ -1352,7 +1444,7 @@ public:
 			if (raw_type)
 				raw += in;
 			else
-				if(!EVP_SignUpdate(&mdctx, in.data(), (unsigned int)in.size()))
+				if(!EVP_SignUpdate(mdctx, in.data(), (unsigned int)in.size()))
 					state = SignError;
 		}
 		else if(state == VerifyActive)
@@ -1360,7 +1452,7 @@ public:
 			if (raw_type)
 				raw += in;
 			else
-				if(!EVP_VerifyUpdate(&mdctx, in.data(), (unsigned int)in.size()))
+				if(!EVP_VerifyUpdate(mdctx, in.data(), (unsigned int)in.size()))
 					state = VerifyError;
 		}
 	}
@@ -1373,17 +1465,29 @@ public:
 			unsigned int len = out.size();
 			if (raw_type)
 			{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				if (pkey->type == EVP_PKEY_RSA)
 				{
 					if(RSA_private_encrypt (raw.size(), (unsigned char *)raw.data(),
 											(unsigned char *)out.data(), pkey->pkey.rsa,
 											RSA_PKCS1_PADDING) == -1) {
+#else
+				if (EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA)
+				{
+					if(RSA_private_encrypt (raw.size(), (unsigned char *)raw.data(),
+											(unsigned char *)out.data(), EVP_PKEY_get0_RSA(pkey),
+											RSA_PKCS1_PADDING) == -1) {
+#endif
 
 						state = SignError;
 						return SecureArray ();
 					}
 				}
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				else if (pkey->type == EVP_PKEY_DSA)
+#else
+				else if (EVP_PKEY_base_id(pkey) == EVP_PKEY_DSA)
+#endif
 				{
 					state = SignError;
 					return SecureArray ();
@@ -1395,7 +1499,7 @@ public:
 				}
 			}
 			else {
-				if(!EVP_SignFinal(&mdctx, (unsigned char *)out.data(), &len, pkey))
+				if(!EVP_SignFinal(mdctx, (unsigned char *)out.data(), &len, pkey))
 				{
 					state = SignError;
 					return SecureArray();
@@ -1418,16 +1522,27 @@ public:
 				SecureArray out(EVP_PKEY_size(pkey));
 				int len = 0;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				if (pkey->type == EVP_PKEY_RSA) {
 					if((len = RSA_public_decrypt (sig.size(), (unsigned char *)sig.data(),
 												  (unsigned char *)out.data (), pkey->pkey.rsa,
 												  RSA_PKCS1_PADDING)) == -1) {
+#else
+				if (EVP_PKEY_base_id(pkey) == EVP_PKEY_RSA) {
+					if((len = RSA_public_decrypt (sig.size(), (unsigned char *)sig.data(),
+												  (unsigned char *)out.data (), EVP_PKEY_get0_RSA(pkey),
+												  RSA_PKCS1_PADDING)) == -1) {
+#endif
 
 						state = VerifyError;
 						return false;
 					}
 				}
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				else if (pkey->type == EVP_PKEY_DSA)
+#else
+				else if (EVP_PKEY_base_id(pkey) == EVP_PKEY_DSA)
+#endif
 				{
 					state = VerifyError;
 					return false;
@@ -1447,7 +1562,7 @@ public:
 			}
 			else
 			{
-				if(EVP_VerifyFinal(&mdctx, (unsigned char *)sig.data(), (unsigned int)sig.size(), pkey) != 1)
+				if(EVP_VerifyFinal(mdctx, (unsigned char *)sig.data(), (unsigned int)sig.size(), pkey) != 1)
 				{
 					state = VerifyError;
 					return false;
@@ -1556,6 +1671,7 @@ public:
 static bool make_dlgroup(const QByteArray &seed, int bits, int counter, DLParams *params)
 {
 	int ret_counter;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	DSA *dsa = DSA_generate_parameters(bits, (unsigned char *)seed.data(), seed.size(), &ret_counter, NULL, NULL, NULL);
 	if(!dsa)
 		return false;
@@ -1564,6 +1680,20 @@ static bool make_dlgroup(const QByteArray &seed, int bits, int counter, DLParams
 	params->p = bn2bi(dsa->p);
 	params->q = bn2bi(dsa->q);
 	params->g = bn2bi(dsa->g);
+#else
+	DSA *dsa = DSA_new();
+	if(!DSA_generate_parameters_ex(dsa, bits, (unsigned char *)seed.data(), seed.size(), &ret_counter, NULL, NULL))
+		return false;
+	if(ret_counter != counter)
+		return false;
+	{
+		const BIGNUM *p, *q, *g;
+		DSA_get0_pqg(dsa, &p, &q, &g);
+		params->p = bn2bi(p);
+		params->q = bn2bi(q);
+		params->g = bn2bi(g);
+	}
+#endif
 	DSA_free(dsa);
 	return true;
 }
@@ -1755,9 +1885,18 @@ public:
 
 	virtual void run()
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		RSA *rsa = RSA_generate_key(bits, exp, NULL, NULL);
 		if(!rsa)
 			return;
+#else
+		RSA *rsa = RSA_new();
+		BIGNUM *exp_bn = BN_new();
+		if(!BN_set_word(exp_bn, exp))
+			return;
+		if(!RSA_generate_key_ex(rsa, bits, exp_bn, NULL))
+			return;
+#endif
 		result = rsa;
 	}
 
@@ -1826,10 +1965,18 @@ public:
 			return;
 
 		// extract the public key into DER format
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		int len = i2d_RSAPublicKey(evp.pkey->pkey.rsa, NULL);
+#else
+		int len = i2d_RSA_PUBKEY(EVP_PKEY_get0_RSA(evp.pkey), NULL);
+#endif
 		SecureArray result(len);
 		unsigned char *p = (unsigned char *)result.data();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		i2d_RSAPublicKey(evp.pkey->pkey.rsa, &p);
+#else
+		i2d_RSA_PUBKEY(EVP_PKEY_get0_RSA(evp.pkey), &p);
+#endif
 		p = (unsigned char *)result.data();
 
 		// put the DER public key back into openssl
@@ -1837,8 +1984,10 @@ public:
 		RSA *rsa;
 #ifdef OSSL_097
 		rsa = d2i_RSAPublicKey(NULL, (const unsigned char **)&p, result.size());
-#else
+#elif OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		rsa = d2i_RSAPublicKey(NULL, (unsigned char **)&p, result.size());
+#else
+		rsa = d2i_RSA_PUBKEY(NULL, (unsigned char **)&p, result.size());
 #endif
 		evp.pkey = EVP_PKEY_new();
 		EVP_PKEY_assign_RSA(evp.pkey, rsa);
@@ -1852,7 +2001,11 @@ public:
 
 	virtual int maximumEncryptSize(EncryptionAlgorithm alg) const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		RSA *rsa = evp.pkey->pkey.rsa;
+#else
+		RSA *rsa = EVP_PKEY_get0_RSA(evp.pkey);
+#endif
 		int size = 0;
 		switch(alg)
 		{
@@ -1867,7 +2020,11 @@ public:
 
 	virtual SecureArray encrypt(const SecureArray &in, EncryptionAlgorithm alg)
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		RSA *rsa = evp.pkey->pkey.rsa;
+#else
+		RSA *rsa = EVP_PKEY_get0_RSA(evp.pkey);
+#endif
 		SecureArray buf = in;
 		int max = maximumEncryptSize(alg);
 
@@ -1900,7 +2057,11 @@ public:
 
 	virtual bool decrypt(const SecureArray &in, SecureArray *out, EncryptionAlgorithm alg)
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		RSA *rsa = evp.pkey->pkey.rsa;
+#else
+		RSA *rsa = EVP_PKEY_get0_RSA(evp.pkey);
+#endif
 		SecureArray result(RSA_size(rsa));
 		int pad;
 
@@ -2021,6 +2182,7 @@ public:
 		evp.reset();
 
 		RSA *rsa = RSA_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		rsa->n = bi2bn(n);
 		rsa->e = bi2bn(e);
 		rsa->p = bi2bn(p);
@@ -2028,6 +2190,10 @@ public:
 		rsa->d = bi2bn(d);
 
 		if(!rsa->n || !rsa->e || !rsa->p || !rsa->q || !rsa->d)
+#else
+		if( !RSA_set0_key(rsa, bi2bn(n), bi2bn(e), bi2bn(d)) ||
+				!RSA_set0_factors(rsa, bi2bn(p), bi2bn(q)))
+#endif
 		{
 			RSA_free(rsa);
 			return;
@@ -2036,8 +2202,13 @@ public:
 		// When private key has no Public Exponent (e) or Private Exponent (d)
 		// need to disable blinding. Otherwise decryption will be broken.
 		// http://www.mail-archive.com/openssl-users@openssl.org/msg63530.html
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(BN_is_zero(rsa->e) || BN_is_zero(rsa->d))
 			RSA_blinding_off(rsa);
+#else
+		if(BN_is_zero(bi2bn(e)) || BN_is_zero(bi2bn(d)))
+			RSA_blinding_off(rsa);
+#endif
 
 		evp.pkey = EVP_PKEY_new();
 		EVP_PKEY_assign_RSA(evp.pkey, rsa);
@@ -2049,10 +2220,14 @@ public:
 		evp.reset();
 
 		RSA *rsa = RSA_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		rsa->n = bi2bn(n);
 		rsa->e = bi2bn(e);
 
 		if(!rsa->n || !rsa->e)
+#else
+		if(!RSA_set0_key(rsa, bi2bn(n), bi2bn(e), NULL))
+#endif
 		{
 			RSA_free(rsa);
 			return;
@@ -2065,27 +2240,72 @@ public:
 
 	virtual BigInteger n() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.rsa->n);
+#else
+		RSA *rsa;
+		const BIGNUM *n, *e, *d;
+
+		rsa = EVP_PKEY_get0_RSA(evp.pkey);
+		RSA_get0_key(rsa, &n, &e, &d);
+		return bn2bi(n);
+#endif
 	}
 
 	virtual BigInteger e() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.rsa->e);
+#else
+		RSA *rsa;
+		const BIGNUM *n, *e, *d;
+
+		rsa = EVP_PKEY_get0_RSA(evp.pkey);
+		RSA_get0_key(rsa, &n, &e, &d);
+		return bn2bi(e);
+#endif
 	}
 
 	virtual BigInteger p() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.rsa->p);
+#else
+		RSA *rsa;
+		const BIGNUM *p, *q;
+
+		rsa = EVP_PKEY_get0_RSA(evp.pkey);
+		RSA_get0_factors(rsa, &p, &q);
+		return bn2bi(p);
+#endif
 	}
 
 	virtual BigInteger q() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.rsa->q);
+#else
+		RSA *rsa;
+		const BIGNUM *p, *q;
+
+		rsa = EVP_PKEY_get0_RSA(evp.pkey);
+		RSA_get0_factors(rsa, &p, &q);
+		return bn2bi(q);
+#endif
 	}
 
 	virtual BigInteger d() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.rsa->d);
+#else
+		RSA *rsa;
+		const BIGNUM *n, *e, *d;
+
+		rsa = EVP_PKEY_get0_RSA(evp.pkey);
+		RSA_get0_key(rsa, &n, &e, &d);
+		return bn2bi(d);
+#endif
 	}
 
 private slots:
@@ -2134,10 +2354,15 @@ public:
 	virtual void run()
 	{
 		DSA *dsa = DSA_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dsa->p = bi2bn(domain.p());
 		dsa->q = bi2bn(domain.q());
 		dsa->g = bi2bn(domain.g());
 		if(!DSA_generate_key(dsa))
+#else
+		if( !DSA_set0_pqg(dsa, bi2bn(domain.p()), bi2bn(domain.g()), bi2bn(domain.q())) ||
+			!DSA_generate_key(dsa))
+#endif
 		{
 			DSA_free(dsa);
 			return;
@@ -2212,10 +2437,18 @@ public:
 			return;
 
 		// extract the public key into DER format
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		int len = i2d_DSAPublicKey(evp.pkey->pkey.dsa, NULL);
+#else
+		int len = i2d_DSAPublicKey(EVP_PKEY_get0_DSA(evp.pkey), NULL);
+#endif
 		SecureArray result(len);
 		unsigned char *p = (unsigned char *)result.data();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		i2d_DSAPublicKey(evp.pkey->pkey.dsa, &p);
+#else
+		i2d_DSAPublicKey(EVP_PKEY_get0_DSA(evp.pkey), &p);
+#endif
 		p = (unsigned char *)result.data();
 
 		// put the DER public key back into openssl
@@ -2244,7 +2477,11 @@ public:
 		else
 			transformsig = false;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		evp.startSign(EVP_dss1());
+#else
+		evp.startSign(EVP_sha1());
+#endif
 	}
 
 	virtual void startVerify(SignatureAlgorithm, SignatureFormat format)
@@ -2255,7 +2492,11 @@ public:
 		else
 			transformsig = false;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		evp.startVerify(EVP_dss1());
+#else
+		evp.startVerify(EVP_sha1());
+#endif
 	}
 
 	virtual void update(const MemoryRegion &in)
@@ -2305,6 +2546,7 @@ public:
 		evp.reset();
 
 		DSA *dsa = DSA_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dsa->p = bi2bn(domain.p());
 		dsa->q = bi2bn(domain.q());
 		dsa->g = bi2bn(domain.g());
@@ -2312,6 +2554,10 @@ public:
 		dsa->priv_key = bi2bn(x);
 
 		if(!dsa->p || !dsa->q || !dsa->g || !dsa->pub_key || !dsa->priv_key)
+#else
+		if( !DSA_set0_pqg(dsa, bi2bn(domain.p()), bi2bn(domain.g()), bi2bn(domain.q())) ||
+				!DSA_set0_key(dsa, bi2bn(y), bi2bn(x)) )
+#endif
 		{
 			DSA_free(dsa);
 			return;
@@ -2327,12 +2573,17 @@ public:
 		evp.reset();
 
 		DSA *dsa = DSA_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dsa->p = bi2bn(domain.p());
 		dsa->q = bi2bn(domain.q());
 		dsa->g = bi2bn(domain.g());
 		dsa->pub_key = bi2bn(y);
 
 		if(!dsa->p || !dsa->q || !dsa->g || !dsa->pub_key)
+#else
+		if( !DSA_set0_pqg(dsa, bi2bn(domain.p()), bi2bn(domain.g()), bi2bn(domain.q())) ||
+						!DSA_set0_key(dsa, bi2bn(y), NULL) )
+#endif
 		{
 			DSA_free(dsa);
 			return;
@@ -2345,17 +2596,47 @@ public:
 
 	virtual DLGroup domain() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return DLGroup(bn2bi(evp.pkey->pkey.dsa->p), bn2bi(evp.pkey->pkey.dsa->q), bn2bi(evp.pkey->pkey.dsa->g));
+#else
+		DSA *dsa;
+		const BIGNUM *p, *g, *q;
+
+		dsa = EVP_PKEY_get0_DSA(evp.pkey);
+		DSA_get0_pqg(dsa, &p, &g, &q);
+
+		return DLGroup(bn2bi(p), bn2bi(q), bn2bi(g));
+#endif
 	}
 
 	virtual BigInteger y() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.dsa->pub_key);
+#else
+		DSA *dsa;
+		const BIGNUM *pub_key, *priv_key;
+
+		dsa = EVP_PKEY_get0_DSA(evp.pkey);
+		DSA_get0_key(dsa, &pub_key, &priv_key);
+
+		return bn2bi(pub_key);
+#endif
 	}
 
 	virtual BigInteger x() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.dsa->priv_key);
+#else
+		DSA *dsa;
+		const BIGNUM *pub_key, *priv_key;
+
+		dsa = EVP_PKEY_get0_DSA(evp.pkey);
+		DSA_get0_key(dsa, &pub_key, &priv_key);
+
+		return bn2bi(priv_key);
+#endif
 	}
 
 private slots:
@@ -2404,9 +2685,13 @@ public:
 	virtual void run()
 	{
 		DH *dh = DH_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dh->p = bi2bn(domain.p());
 		dh->g = bi2bn(domain.g());
 		if(!DH_generate_key(dh))
+#else
+		if( !DH_set0_pqg(dh, bi2bn(domain.p()), NULL, bi2bn(domain.g())) || !DH_generate_key(dh) )
+#endif
 		{
 			DH_free(dh);
 			return;
@@ -2478,11 +2763,21 @@ public:
 		if(!sec)
 			return;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		DH *orig = evp.pkey->pkey.dh;
 		DH *dh = DH_new();
 		dh->p = BN_dup(orig->p);
 		dh->g = BN_dup(orig->g);
 		dh->pub_key = BN_dup(orig->pub_key);
+#else
+		DH *orig = EVP_PKEY_get0_DH(evp.pkey);
+		const BIGNUM *op, *oq, *og, *opub_key, *opriv_key;
+		DH_get0_pqg(orig, &op, &oq, &og);
+		DH_get0_key(orig, &opub_key, &opriv_key);
+		DH *dh = DH_new();
+		DH_set0_pqg(dh, BN_dup(op), NULL, BN_dup(og));
+		DH_set0_key(dh, BN_dup(opub_key), NULL);
+#endif
 
 		evp.reset();
 
@@ -2498,10 +2793,19 @@ public:
 
 	virtual SymmetricKey deriveKey(const PKeyBase &theirs)
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		DH *dh = evp.pkey->pkey.dh;
 		DH *them = static_cast<const DHKey *>(&theirs)->evp.pkey->pkey.dh;
 		SecureArray result(DH_size(dh));
 		int ret = DH_compute_key((unsigned char *)result.data(), them->pub_key, dh);
+#else
+		DH *dh = EVP_PKEY_get0_DH(evp.pkey);
+		DH *them = EVP_PKEY_get0_DH(static_cast<const DHKey *>(&theirs)->evp.pkey);
+		SecureArray result(DH_size(dh));
+		const BIGNUM *thempub_key, *thempriv_key;
+		DH_get0_key(them, &thempub_key, &thempriv_key);
+		int ret = DH_compute_key((unsigned char *)result.data(), thempub_key, dh);
+#endif
 		if(ret <= 0)
 			return SymmetricKey();
 		result.resize(ret);
@@ -2531,12 +2835,16 @@ public:
 		evp.reset();
 
 		DH *dh = DH_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dh->p = bi2bn(domain.p());
 		dh->g = bi2bn(domain.g());
 		dh->pub_key = bi2bn(y);
 		dh->priv_key = bi2bn(x);
 
 		if(!dh->p || !dh->g || !dh->pub_key || !dh->priv_key)
+#else
+		if( !DH_set0_pqg(dh, bi2bn(domain.p()), NULL, bi2bn(domain.g())) || !DH_set0_key(dh, bi2bn(y), bi2bn(x)) )
+#endif
 		{
 			DH_free(dh);
 			return;
@@ -2552,11 +2860,15 @@ public:
 		evp.reset();
 
 		DH *dh = DH_new();
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		dh->p = bi2bn(domain.p());
 		dh->g = bi2bn(domain.g());
 		dh->pub_key = bi2bn(y);
 
 		if(!dh->p || !dh->g || !dh->pub_key)
+#else
+		if( !DH_set0_pqg(dh, bi2bn(domain.p()), NULL, bi2bn(domain.g())) || !DH_set0_key(dh, bi2bn(y), NULL) )
+#endif
 		{
 			DH_free(dh);
 			return;
@@ -2569,17 +2881,44 @@ public:
 
 	virtual DLGroup domain() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return DLGroup(bn2bi(evp.pkey->pkey.dh->p), bn2bi(evp.pkey->pkey.dh->g));
+#else
+		DH *dh;
+		const BIGNUM *p, *q, *g;
+
+		dh = EVP_PKEY_get0_DH(evp.pkey);
+		DH_get0_pqg(dh, &p, &q, &g);
+		return DLGroup(bn2bi(p), bn2bi(g));
+#endif
 	}
 
 	virtual BigInteger y() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.dh->pub_key);
+#else
+		DH *dh;
+		const BIGNUM *pub_key, *priv_key;
+
+		dh = EVP_PKEY_get0_DH(evp.pkey);
+		DH_get0_key(dh, &pub_key, &priv_key);
+		return bn2bi(pub_key);
+#endif
 	}
 
 	virtual BigInteger x() const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		return bn2bi(evp.pkey->pkey.dh->priv_key);
+#else
+		DH *dh;
+		const BIGNUM *pub_key, *priv_key;
+
+		dh = EVP_PKEY_get0_DH(evp.pkey);
+		DH_get0_key(dh, &pub_key, &priv_key);
+		return bn2bi(priv_key);
+#endif
 	}
 
 private slots:
@@ -2618,10 +2957,16 @@ public:
 	{
 		key = _key;
 		RSA_set_method(rsa, rsa_method());
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		rsa->flags |= RSA_FLAG_SIGN_VER;
+#endif
 		RSA_set_app_data(rsa, this);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		rsa->n = bi2bn(_key.n());
 		rsa->e = bi2bn(_key.e());
+#else
+		RSA_set0_key(rsa, bi2bn(_key.n()), bi2bn(_key.e()), NULL);
+#endif
 	}
 
 	RSA_METHOD *rsa_method()
@@ -2630,12 +2975,21 @@ public:
 
 		if(!ops)
 		{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			ops = new RSA_METHOD(*RSA_get_default_method());
 			ops->rsa_priv_enc = 0;//pkcs11_rsa_encrypt;
 			ops->rsa_priv_dec = rsa_priv_dec;
 			ops->rsa_sign = rsa_sign;
 			ops->rsa_verify = 0;//pkcs11_rsa_verify;
 			ops->finish = rsa_finish;
+#else
+			ops = RSA_meth_dup(RSA_get_default_method());
+			RSA_meth_set_priv_enc(ops, 0);
+			RSA_meth_set_priv_dec(ops, rsa_priv_dec);
+			RSA_meth_set_sign(ops, rsa_sign);
+			RSA_meth_set_verify(ops, 0);
+			RSA_meth_set_finish(ops, rsa_finish);
+#endif
 		}
 		return ops;
 	}
@@ -2654,7 +3008,11 @@ public:
 		}
 		else
 		{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			RSAerr(RSA_F_RSA_EAY_PRIVATE_DECRYPT, RSA_R_UNKNOWN_PADDING_TYPE);
+#else
+			RSAerr(RSA_F_RSA_OSSL_PRIVATE_DECRYPT, RSA_R_UNKNOWN_PADDING_TYPE);
+#endif
 			return -1;
 		}
 
@@ -2693,7 +3051,7 @@ public:
 		{
 
 			// make X509 packet
-			X509_SIG sig;
+			X509_SIG *sig = X509_SIG_new();
 			ASN1_TYPE parameter;
 
 			X509_ALGOR algor;
@@ -2702,27 +3060,48 @@ public:
 			//int rsa_size = 128;
 			//CK_ULONG sigsize = rsa_size;
 
-			sig.algor= &algor;
-			sig.algor->algorithm=OBJ_nid2obj(type);
-			if (sig.algor->algorithm == NULL)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+			sig->algor= &algor;
+			sig->algor->algorithm=OBJ_nid2obj(type);
+			if (sig->algor->algorithm == NULL)
 			{
 				//RSAerr(RSA_F_RSA_SIGN,RSA_R_UNKNOWN_ALGORITHM_TYPE);
 				return 0;
 			}
-			if (sig.algor->algorithm->length == 0)
+			if (sig->algor->algorithm->length == 0)
 			{
 				//RSAerr(RSA_F_RSA_SIGN,RSA_R_THE_ASN1_OBJECT_IDENTIFIER_IS_NOT_KNOWN_FOR_THIS_MD);
 				return 0;
 			}
 			parameter.type=V_ASN1_NULL;
 			parameter.value.ptr=NULL;
-			sig.algor->parameter= &parameter;
+			sig->algor->parameter= &parameter;
 
-			sig.digest= &digest;
-			sig.digest->data=(unsigned char *)m; /* TMP UGLY CAST */
-			sig.digest->length=m_len;
+			sig->digest= &digest;
+			sig->digest->data=(unsigned char *)m; /* TMP UGLY CAST */
+			sig->digest->length=m_len;
+#else
+			X509_ALGOR *sig_palg;
+			ASN1_OCTET_STRING *sig_pdigest;
+			X509_SIG_getm(sig, &sig_palg, &sig_pdigest);
 
-			i=i2d_X509_SIG(&sig,NULL);
+			sig_palg = &algor;
+			sig_palg->algorithm=OBJ_nid2obj(type);
+			if (sig_palg->algorithm == NULL)
+			{
+				//RSAerr(RSA_F_RSA_SIGN,RSA_R_UNKNOWN_ALGORITHM_TYPE);
+				return 0;
+			}
+			parameter.type=V_ASN1_NULL;
+			parameter.value.ptr=NULL;
+			sig_palg->parameter= &parameter;
+
+			sig_pdigest= &digest;
+			sig_pdigest->data=(unsigned char *)m; /* TMP UGLY CAST */
+			sig_pdigest->length=m_len;
+#endif
+
+			i=i2d_X509_SIG(sig,NULL);
 
 			j=rsa_size;
 			if (i > (j-RSA_PKCS1_PADDING_SIZE))
@@ -2738,7 +3117,7 @@ public:
 				return 0;
 			}
 			p=tmps;
-			i2d_X509_SIG(&sig,&p);
+			i2d_X509_SIG(sig,&p);
 			s=tmps;
 			m = s;
 			m_len = i;
@@ -2866,21 +3245,33 @@ public:
 	PKeyBase *pkeyToBase(EVP_PKEY *pkey, bool sec) const
 	{
 		PKeyBase *nk = 0;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(pkey->type == EVP_PKEY_RSA)
+#else
+		if(EVP_PKEY_id(pkey) == EVP_PKEY_RSA)
+#endif
 		{
 			RSAKey *c = new RSAKey(provider());
 			c->evp.pkey = pkey;
 			c->sec = sec;
 			nk = c;
 		}
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		else if(pkey->type == EVP_PKEY_DSA)
+#else
+		else if(EVP_PKEY_id(pkey) == EVP_PKEY_DSA)
+#endif
 		{
 			DSAKey *c = new DSAKey(provider());
 			c->evp.pkey = pkey;
 			c->sec = sec;
 			nk = c;
 		}
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		else if(pkey->type == EVP_PKEY_DH)
+#else
+		else if(EVP_PKEY_id(pkey) == EVP_PKEY_DH)
+#endif
 		{
 			DHKey *c = new DHKey(provider());
 			c->evp.pkey = pkey;
@@ -2899,8 +3290,14 @@ public:
 		EVP_PKEY *pkey = get_pkey();
 
 		// OpenSSL does not have DH import/export support
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(pkey->type == EVP_PKEY_DH)
 			return QByteArray();
+#else
+		if(EVP_PKEY_id(pkey) == EVP_PKEY_DH)
+			return QByteArray();
+#endif
+
 
 		BIO *bo = BIO_new(BIO_s_mem());
 		i2d_PUBKEY_bio(bo, pkey);
@@ -2913,8 +3310,13 @@ public:
 		EVP_PKEY *pkey = get_pkey();
 
 		// OpenSSL does not have DH import/export support
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(pkey->type == EVP_PKEY_DH)
 			return QString();
+#else
+		if(EVP_PKEY_id(pkey) == EVP_PKEY_DH)
+			return QString();
+#endif
 
 		BIO *bo = BIO_new(BIO_s_mem());
 		PEM_write_bio_PUBKEY(bo, pkey);
@@ -2980,8 +3382,13 @@ public:
 		EVP_PKEY *pkey = get_pkey();
 
 		// OpenSSL does not have DH import/export support
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(pkey->type == EVP_PKEY_DH)
 			return SecureArray();
+#else
+		if(EVP_PKEY_id(pkey) == EVP_PKEY_DH)
+			return SecureArray();
+#endif
 
 		BIO *bo = BIO_new(BIO_s_mem());
 		if(!passphrase.isEmpty())
@@ -3009,8 +3416,13 @@ public:
 		EVP_PKEY *pkey = get_pkey();
 
 		// OpenSSL does not have DH import/export support
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if(pkey->type == EVP_PKEY_DH)
 			return QString();
+#else
+		if(EVP_PKEY_id(pkey) == EVP_PKEY_DH)
+			return QString();
+#endif
 
 		BIO *bo = BIO_new(BIO_s_mem());
 		if(!passphrase.isEmpty())
@@ -3109,12 +3521,21 @@ public:
 			req = from.req;
 			crl = from.crl;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			if(cert)
 				CRYPTO_add(&cert->references, 1, CRYPTO_LOCK_X509);
 			if(req)
 				CRYPTO_add(&req->references, 1, CRYPTO_LOCK_X509_REQ);
 			if(crl)
 				CRYPTO_add(&crl->references, 1, CRYPTO_LOCK_X509_CRL);
+#else
+			if(cert)
+				X509_up_ref(cert);
+			if(req)
+				req = X509_REQ_dup(from.req);
+			if(crl)
+				X509_CRL_up_ref(crl);
+#endif
 		}
 
 		return *this;
@@ -3220,7 +3641,7 @@ public:
 //
 // This code is mostly taken from OpenSSL v0.9.5a
 // by Eric Young
-QDateTime ASN1_UTCTIME_QDateTime(ASN1_UTCTIME *tm, int *isGmt)
+QDateTime ASN1_UTCTIME_QDateTime(const ASN1_UTCTIME *tm, int *isGmt)
 {
 	QDateTime qdt;
 	char *v;
@@ -3318,7 +3739,11 @@ public:
 
 	void fromX509(X509 *x)
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		item.cert = x;
 		make_props();
 	}
@@ -3349,7 +3774,11 @@ public:
 		if(priv.key()->type() == PKey::RSA)
 			md = EVP_sha1();
 		else if(priv.key()->type() == PKey::DSA)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			md = EVP_dss1();
+#else
+			md = EVP_sha1();
+#endif
 		else
 			return false;
 
@@ -3363,8 +3792,13 @@ public:
 		BN_free(bn);
 
 		// validity period
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		ASN1_TIME_set(X509_get_notBefore(x), opts.notValidBefore().toTime_t());
 		ASN1_TIME_set(X509_get_notAfter(x), opts.notValidAfter().toTime_t());
+#else
+		ASN1_TIME_set(X509_getm_notBefore(x), opts.notValidBefore().toTime_t());
+		ASN1_TIME_set(X509_getm_notAfter(x), opts.notValidAfter().toTime_t());
+#endif
 
 		// public key
 		X509_set_pubkey(x, pk);
@@ -3480,7 +3914,11 @@ public:
 
 		const MyCertContext *our_cc = this;
 		X509 *x = our_cc->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		sk_X509_push(untrusted_list, x);
 
 		const MyCertContext *other_cc = static_cast<const MyCertContext *>(other);
@@ -3495,7 +3933,11 @@ public:
 		X509_verify_cert(ctx);
 
 		// grab the chain, which may not be fully populated
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		STACK_OF(X509) *chain = X509_STORE_CTX_get_chain(ctx);
+#else
+		STACK_OF(X509) *chain = X509_STORE_CTX_get0_chain(ctx);
+#endif
 
 		bool ok = false;
 
@@ -3535,8 +3977,13 @@ public:
 			p.serial.fromString(str);
 		}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		p.start = ASN1_UTCTIME_QDateTime(X509_get_notBefore(x), NULL);
 		p.end = ASN1_UTCTIME_QDateTime(X509_get_notAfter(x), NULL);
+#else
+		p.start = ASN1_UTCTIME_QDateTime(X509_get0_notBefore(x), NULL);
+		p.end = ASN1_UTCTIME_QDateTime(X509_get0_notAfter(x), NULL);
+#endif
 
 		CertificateInfo subject, issuer;
 
@@ -3595,6 +4042,7 @@ public:
 				p.policies = get_cert_policies(ex);
 		}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if (x->signature)
 		{
 			p.sig = QByteArray(x->signature->length, 0);
@@ -3603,6 +4051,21 @@ public:
 		}
 
 		switch( OBJ_obj2nid(x->cert_info->signature->algorithm) )
+#else
+		const ASN1_BIT_STRING *x_psig;
+		const X509_ALGOR *x_palg;
+		X509_get0_signature(&x_psig, &x_palg, x);
+		if (x_psig)
+		{
+			int x_psig_length = ASN1_STRING_length(x_psig);
+			const unsigned char *x_psig_data = ASN1_STRING_get0_data(x_psig);
+			p.sig = QByteArray(x_psig_length, 0);
+			for (int i=0; i< x_psig_length; i++)
+				p.sig[i] = x_psig_data[i];
+		}
+
+		switch( X509_get_signature_nid(x) )
+#endif
 		{
 		case NID_sha1WithRSAEncryption:
 			p.sigalgo = QCA::EMSA3_SHA1;
@@ -3634,8 +4097,13 @@ public:
 			p.sigalgo = QCA::EMSA3_SHA512;
 			break;
 		default:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			qDebug() << "Unknown signature value: " << OBJ_obj2nid(x->cert_info->signature->algorithm);
 			p.sigalgo = QCA::SignatureUnknown;
+#else
+			qDebug() << "Unknown signature value: " << X509_get_signature_nid(x);
+			p.sigalgo = QCA::SignatureUnknown;
+#endif
 		}
 
 		pos = X509_get_ext_by_NID(x, NID_subject_key_identifier, -1);
@@ -3751,7 +4219,11 @@ public:
 		if(privateKey -> key()->type() == PKey::RSA)
 			md = EVP_sha1();
 		else if(privateKey -> key()->type() == PKey::DSA)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			md = EVP_dss1();
+#else
+			md = EVP_sha1();
+#endif
 		else
 			return 0;
 
@@ -3770,8 +4242,13 @@ public:
 		BN_free(bn);
 
 		// validity period
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		ASN1_TIME_set(X509_get_notBefore(x), QDateTime::currentDateTime().toUTC().toTime_t());
 		ASN1_TIME_set(X509_get_notAfter(x), notValidAfter.toTime_t());
+#else
+		ASN1_TIME_set(X509_getm_notBefore(x), QDateTime::currentDateTime().toUTC().toTime_t());
+		ASN1_TIME_set(X509_getm_notAfter(x), notValidAfter.toTime_t());
+#endif
 
 		X509_set_pubkey(x, static_cast<const MyPKeyContext*>(req.subjectPublicKey()) -> get_pkey());
 		X509_set_subject_name(x, subjectName);
@@ -3934,7 +4411,11 @@ public:
 		if(priv.key()->type() == PKey::RSA)
 			md = EVP_sha1();
 		else if(priv.key()->type() == PKey::DSA)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			md = EVP_dss1();
+#else
+			md = EVP_sha1();
+#endif
 		else
 			return false;
 
@@ -4095,6 +4576,7 @@ public:
 
 		sk_X509_EXTENSION_pop_free(exts, X509_EXTENSION_free);
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if (x->signature)
 		{
 			p.sig = QByteArray(x->signature->length, 0);
@@ -4103,6 +4585,23 @@ public:
 		}
 
 		switch( OBJ_obj2nid(x->sig_alg->algorithm) )
+#else
+		{
+			const ASN1_BIT_STRING *x_psig;
+			const X509_ALGOR *x_palg;
+			X509_REQ_get0_signature(x, &x_psig, &x_palg);
+			if (x_psig)
+			{
+				int x_psig_length = ASN1_STRING_length(x_psig);
+				const unsigned char *x_psig_data = ASN1_STRING_get0_data(x_psig);
+				p.sig = QByteArray(x_psig_length, 0);
+				for (int i=0; i< x_psig_length; i++)
+					p.sig[i] = x_psig_data[i];
+			}
+		}
+
+		switch( X509_REQ_get_signature_nid(x) )
+#endif
 		{
 		case NID_sha1WithRSAEncryption:
 			p.sigalgo = QCA::EMSA3_SHA1;
@@ -4122,7 +4621,11 @@ public:
 			p.sigalgo = QCA::EMSA1_SHA1;
 			break;
 		default:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			qDebug() << "Unknown signature value: " << OBJ_obj2nid(x->sig_alg->algorithm);
+#else
+			qDebug() << "Unknown signature value: " << X509_REQ_get_signature_nid(x);
+#endif
 			p.sigalgo = QCA::SignatureUnknown;
 		}
 
@@ -4186,7 +4689,11 @@ public:
 
 	void fromX509(X509_CRL *x)
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509_CRL);
+#else
+		X509_CRL_up_ref(x);
+#endif
 		item.crl = x;
 		make_props();
 	}
@@ -4231,15 +4738,25 @@ public:
 
 		issuer = get_cert_name(X509_CRL_get_issuer(x));
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		p.thisUpdate = ASN1_UTCTIME_QDateTime(X509_CRL_get_lastUpdate(x), NULL);
 		p.nextUpdate = ASN1_UTCTIME_QDateTime(X509_CRL_get_nextUpdate(x), NULL);
+#else
+		p.thisUpdate = ASN1_UTCTIME_QDateTime(X509_CRL_get0_lastUpdate(x), NULL);
+		p.nextUpdate = ASN1_UTCTIME_QDateTime(X509_CRL_get0_nextUpdate(x), NULL);
+#endif
 
 		STACK_OF(X509_REVOKED)* revokeStack  = X509_CRL_get_REVOKED(x);
 
 		for (int i = 0; i < sk_X509_REVOKED_num(revokeStack); ++i) {
 			X509_REVOKED *rev = sk_X509_REVOKED_value(revokeStack, i);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			BigInteger serial = bn2bi(ASN1_INTEGER_to_BN(rev->serialNumber, NULL));
 			QDateTime time = ASN1_UTCTIME_QDateTime( rev->revocationDate, NULL);
+#else
+			BigInteger serial = bn2bi(ASN1_INTEGER_to_BN(X509_REVOKED_get0_serialNumber(rev), NULL));
+			QDateTime time = ASN1_UTCTIME_QDateTime( X509_REVOKED_get0_revocationDate(rev), NULL);
+#endif
 			QCA::CRLEntry::Reason reason = QCA::CRLEntry::Unspecified;
 			int pos = X509_REVOKED_get_ext_by_NID(rev, NID_crl_reason, -1);
 			if (pos != -1) {
@@ -4288,6 +4805,7 @@ public:
 			p.revoked.append(thisEntry);
 		}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		if (x->signature)
 		{
 			p.sig = QByteArray(x->signature->length, 0);
@@ -4295,6 +4813,22 @@ public:
 				p.sig[i] = x->signature->data[i];
 		}
 		switch( OBJ_obj2nid(x->sig_alg->algorithm) )
+#else
+		{
+			const ASN1_BIT_STRING *x_psig;
+			const X509_ALGOR *x_palg;
+			X509_CRL_get0_signature(x, &x_psig, &x_palg);
+			if (x_psig)
+			{
+				int x_psig_length = ASN1_STRING_length(x_psig);
+				const unsigned char *x_psig_data = ASN1_STRING_get0_data(x_psig);
+				p.sig = QByteArray(x_psig_length, 0);
+				for (int i=0; i< x_psig_length; i++)
+					p.sig[i] = x_psig_data[i];
+			}
+		}
+		switch( X509_CRL_get_signature_nid(x) )
+#endif
 		{
 		case NID_sha1WithRSAEncryption:
 			p.sigalgo = QCA::EMSA3_SHA1;
@@ -4326,7 +4860,11 @@ public:
 			p.sigalgo = QCA::EMSA3_SHA512;
 			break;
 		default:
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			qWarning() << "Unknown signature value: " << OBJ_obj2nid(x->sig_alg->algorithm);
+#else
+			qWarning() << "Unknown signature value: " << X509_CRL_get_signature_nid(x);
+#endif
 			p.sigalgo = QCA::SignatureUnknown;
 		}
 
@@ -4487,21 +5025,33 @@ Validity MyCertContext::validate(const QList<CertContext*> &trusted, const QList
 	{
 		const MyCertContext *cc = static_cast<const MyCertContext *>(trusted[n]);
 		X509 *x = cc->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		sk_X509_push(trusted_list, x);
 	}
 	for(n = 0; n < untrusted.count(); ++n)
 	{
 		const MyCertContext *cc = static_cast<const MyCertContext *>(untrusted[n]);
 		X509 *x = cc->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		sk_X509_push(untrusted_list, x);
 	}
 	for(n = 0; n < crls.count(); ++n)
 	{
 		const MyCRLContext *cc = static_cast<const MyCRLContext *>(crls[n]);
 		X509_CRL *x = cc->item.crl;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509_CRL);
+#else
+		X509_CRL_up_ref(x);
+#endif
 		crl_list.append(x);
 	}
 
@@ -4520,13 +5070,21 @@ Validity MyCertContext::validate(const QList<CertContext*> &trusted, const QList
 	X509_STORE_CTX_init(ctx, store, x, untrusted_list);
 
 	// this initializes the trusted certs
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	X509_STORE_CTX_trusted_stack(ctx, trusted_list);
+#else
+	X509_STORE_CTX_set0_trusted_stack(ctx, trusted_list);
+#endif
 
 	// verify!
 	int ret = X509_verify_cert(ctx);
 	int err = -1;
 	if(!ret)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		err = ctx->error;
+#else
+		err = X509_STORE_CTX_get_error(ctx);
+#endif
 
 	// cleanup
 	X509_STORE_CTX_free(ctx);
@@ -4560,21 +5118,33 @@ Validity MyCertContext::validate_chain(const QList<CertContext*> &chain, const Q
 	{
 		const MyCertContext *cc = static_cast<const MyCertContext *>(trusted[n]);
 		X509 *x = cc->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		sk_X509_push(trusted_list, x);
 	}
 	for(n = 1; n < chain.count(); ++n)
 	{
 		const MyCertContext *cc = static_cast<const MyCertContext *>(chain[n]);
 		X509 *x = cc->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+		X509_up_ref(x);
+#endif
 		sk_X509_push(untrusted_list, x);
 	}
 	for(n = 0; n < crls.count(); ++n)
 	{
 		const MyCRLContext *cc = static_cast<const MyCRLContext *>(crls[n]);
 		X509_CRL *x = cc->item.crl;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509_CRL);
+#else
+		X509_CRL_up_ref(x);
+#endif
 		crl_list.append(x);
 	}
 
@@ -4593,16 +5163,28 @@ Validity MyCertContext::validate_chain(const QList<CertContext*> &chain, const Q
 	X509_STORE_CTX_init(ctx, store, x, untrusted_list);
 
 	// this initializes the trusted certs
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	X509_STORE_CTX_trusted_stack(ctx, trusted_list);
+#else
+	X509_STORE_CTX_set0_trusted_stack(ctx, trusted_list);
+#endif
 
 	// verify!
 	int ret = X509_verify_cert(ctx);
 	int err = -1;
 	if(!ret)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		err = ctx->error;
+#else
+		err = X509_STORE_CTX_get_error(ctx);
+#endif
 
 	// grab the chain, which may not be fully populated
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 	STACK_OF(X509) *xchain = X509_STORE_CTX_get_chain(ctx);
+#else
+	STACK_OF(X509) *xchain = X509_STORE_CTX_get0_chain(ctx);
+#endif
 
 	// make sure the chain is what we expect.  the reason we need to do
 	//   this is because I don't think openssl cares about the order of
@@ -4663,7 +5245,11 @@ public:
 			for(int n = 1; n < chain.count(); ++n)
 			{
 				X509 *x = static_cast<const MyCertContext *>(chain[n])->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+				X509_up_ref(x);
+#endif
 				sk_X509_push(ca, x);
 			}
 		}
@@ -5339,8 +5925,10 @@ public:
 	{
 		if(!ssl_init)
 		{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			SSL_library_init();
 			SSL_load_error_strings();
+#endif
 			ssl_init = true;
 		}
 
@@ -5395,7 +5983,9 @@ public:
 
 	virtual QStringList supportedCipherSuites(const TLS::Version &version) const
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		OpenSSL_add_ssl_algorithms();
+#endif
 		SSL_CTX *ctx = 0;
 		switch (version) {
 #ifndef OPENSSL_NO_SSL2
@@ -5408,9 +5998,11 @@ public:
 			ctx = SSL_CTX_new(SSLv3_client_method());
 			break;
 #endif
+#ifndef OPENSSL_NO_TLS1
 		case TLS::TLS_v1:
 			ctx = SSL_CTX_new(TLSv1_client_method());
 			break;
+#endif
 		case TLS::DTLS_v1:
 		default:
 			/* should not happen - should be in a "dtls" provider*/
@@ -5429,8 +6021,12 @@ public:
 		STACK_OF(SSL_CIPHER) *sk = SSL_get_ciphers(ssl);
 		QStringList cipherList;
 		for(int i = 0; i < sk_SSL_CIPHER_num(sk); ++i) {
-			SSL_CIPHER *thisCipher = sk_SSL_CIPHER_value(sk, i);
+			const SSL_CIPHER *thisCipher = sk_SSL_CIPHER_value(sk, i);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			cipherList += cipherIDtoString(version, thisCipher->id);
+#else
+			cipherList += cipherIDtoString(version, SSL_CIPHER_get_cipher_nid(thisCipher));
+#endif
 		}
 
 		SSL_free(ssl);
@@ -5807,21 +6403,43 @@ public:
 	{
 		SessionInfo sessInfo;
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		sessInfo.isCompressed = (0 != SSL_SESSION_get_compress_id(ssl->session));
+#else
+		sessInfo.isCompressed = (0 != SSL_SESSION_get_compress_id(SSL_get0_session(ssl)));
+#endif
 
-		if (ssl->version == TLS1_VERSION)
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		switch(ssl->version)
+#else
+		switch(SSL_version(ssl))
+#endif
+		{
+#ifndef OPENSSL_NO_TLS1
+		case TLS1_VERSION:
 			sessInfo.version = TLS::TLS_v1;
-		else if (ssl->version == SSL3_VERSION)
+			break;
+#endif
+		case SSL3_VERSION:
 			sessInfo.version = TLS::SSL_v3;
-		else if (ssl->version == SSL2_VERSION)
+			break;
+#ifndef OPENSSL_NO_SSL2
+		case SSL2_VERSION:
 			sessInfo.version = TLS::SSL_v2;
-		else {
+			break;
+#endif
+		default:
 			qDebug("unexpected version response");
 			sessInfo.version = TLS::TLS_v1;
 		}
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		sessInfo.cipherSuite = cipherIDtoString( sessInfo.version,
 												 SSL_get_current_cipher(ssl)->id);
+#else
+		sessInfo.cipherSuite = cipherIDtoString( sessInfo.version,
+												 SSL_CIPHER_get_cipher_nid(SSL_get_current_cipher(ssl)));
+#endif
 
 		sessInfo.cipherMaxBits = SSL_get_cipher_bits(ssl, &(sessInfo.cipherBits));
 
@@ -6393,7 +7011,11 @@ public:
 			for(int n = 0; n < nonroots.count(); ++n)
 			{
 				X509 *x = static_cast<MyCertContext *>(nonroots[n].context())->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+				X509_up_ref(x);
+#endif
 				sk_X509_push(other_certs, x);
 			}
 
@@ -6435,7 +7057,11 @@ public:
 
 			other_certs = sk_X509_new_null();
 			X509 *x = static_cast<MyCertContext *>(target.context())->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+			X509_up_ref(x);
+#endif
 			sk_X509_push(other_certs, x);
 
 			bi = BIO_new(BIO_s_mem());
@@ -6498,7 +7124,11 @@ public:
 			for(int n = 0; n < untrusted_list.count(); ++n)
 			{
 				X509 *x = static_cast<MyCertContext *>(untrusted_list[n].context())->item.cert;
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 				CRYPTO_add(&x->references, 1, CRYPTO_LOCK_X509);
+#else
+				X509_up_ref(x);
+#endif
 				sk_X509_push(other_certs, x);
 			}
 
@@ -6749,14 +7379,22 @@ public:
 	opensslCipherContext(const EVP_CIPHER *algorithm, const int pad, Provider *p, const QString &type) : CipherContext(p, type)
 	{
 		m_cryptoAlgorithm = algorithm;
-		EVP_CIPHER_CTX_init(&m_context);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		EVP_CIPHER_CTX_init(m_context);
+#else
+		m_context = EVP_CIPHER_CTX_new();
+#endif
 		m_pad = pad;
 		m_type = type;
 	}
 
 	~opensslCipherContext()
 	{
-		EVP_CIPHER_CTX_cleanup(&m_context);
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
+		EVP_CIPHER_CTX_cleanup(m_context);
+#else
+		EVP_CIPHER_CTX_free(m_context);
+#endif
 	}
 
 	void setup(Direction dir,
@@ -6769,20 +7407,20 @@ public:
 			m_cryptoAlgorithm = EVP_des_ede();
 		}
 		if (Encode == m_direction) {
-			EVP_EncryptInit_ex(&m_context, m_cryptoAlgorithm, 0, 0, 0);
-			EVP_CIPHER_CTX_set_key_length(&m_context, key.size());
-			EVP_EncryptInit_ex(&m_context, 0, 0,
+			EVP_EncryptInit_ex(m_context, m_cryptoAlgorithm, 0, 0, 0);
+			EVP_CIPHER_CTX_set_key_length(m_context, key.size());
+			EVP_EncryptInit_ex(m_context, 0, 0,
 							   (const unsigned char*)(key.data()),
 							   (const unsigned char*)(iv.data()));
 		} else {
-			EVP_DecryptInit_ex(&m_context, m_cryptoAlgorithm, 0, 0, 0);
-			EVP_CIPHER_CTX_set_key_length(&m_context, key.size());
-			EVP_DecryptInit_ex(&m_context, 0, 0,
+			EVP_DecryptInit_ex(m_context, m_cryptoAlgorithm, 0, 0, 0);
+			EVP_CIPHER_CTX_set_key_length(m_context, key.size());
+			EVP_DecryptInit_ex(m_context, 0, 0,
 							   (const unsigned char*)(key.data()),
 							   (const unsigned char*)(iv.data()));
 		}
 
-		EVP_CIPHER_CTX_set_padding(&m_context, m_pad);
+		EVP_CIPHER_CTX_set_padding(m_context, m_pad);
 	}
 
 	Provider::Context *clone() const
@@ -6792,7 +7430,7 @@ public:
 
 	int blockSize() const
 	{
-		return EVP_CIPHER_CTX_block_size(&m_context);
+		return EVP_CIPHER_CTX_block_size(m_context);
 	}
 
 	bool update(const SecureArray &in, SecureArray *out)
@@ -6805,7 +7443,7 @@ public:
 		out->resize(in.size()+blockSize());
 		int resultLength;
 		if (Encode == m_direction) {
-			if (0 == EVP_EncryptUpdate(&m_context,
+			if (0 == EVP_EncryptUpdate(m_context,
 									   (unsigned char*)out->data(),
 									   &resultLength,
 									   (unsigned char*)in.data(),
@@ -6813,7 +7451,7 @@ public:
 				return false;
 			}
 		} else {
-			if (0 == EVP_DecryptUpdate(&m_context,
+			if (0 == EVP_DecryptUpdate(m_context,
 									   (unsigned char*)out->data(),
 									   &resultLength,
 									   (unsigned char*)in.data(),
@@ -6830,13 +7468,13 @@ public:
 		out->resize(blockSize());
 		int resultLength;
 		if (Encode == m_direction) {
-			if (0 == EVP_EncryptFinal_ex(&m_context,
+			if (0 == EVP_EncryptFinal_ex(m_context,
 										 (unsigned char*)out->data(),
 										 &resultLength)) {
 				return false;
 			}
 		} else {
-			if (0 == EVP_DecryptFinal_ex(&m_context,
+			if (0 == EVP_DecryptFinal_ex(m_context,
 										 (unsigned char*)out->data(),
 										 &resultLength)) {
 				return false;
@@ -6871,7 +7509,7 @@ public:
 
 
 protected:
-	EVP_CIPHER_CTX m_context;
+	EVP_CIPHER_CTX *m_context;
 	const EVP_CIPHER *m_cryptoAlgorithm;
 	Direction m_direction;
 	int m_pad;
@@ -7027,8 +7665,13 @@ public:
 		while (true) {
 			r = RAND_bytes((unsigned char*)(buf.data()), size);
 			if (r == 1) break; // success
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 			r = RAND_pseudo_bytes((unsigned char*)(buf.data()),
 								  size);
+#else
+			r = RAND_bytes((unsigned char*)(buf.data()),
+								  size);
+#endif
 			if (r >= 0) break; // accept insecure random numbers
 		}
 		return buf;
@@ -7051,8 +7694,10 @@ public:
 
 	void init()
 	{
+#if OPENSSL_VERSION_NUMBER < 0x10100000L || defined(LIBRESSL_VERSION_NUMBER)
 		OpenSSL_add_all_algorithms();
 		ERR_load_crypto_strings();
+#endif
 
 		// seed the RNG if it's not seeded yet
 		if (RAND_status() == 0) {
